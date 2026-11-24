@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Trainer Memory & GPU Count Calculator (FSDP × CP, calibrated)</title>
+<style>
+  :root { --bg:#0f1117; --card:#181b24; --fg:#e6e8ee; --mut:#8b90a0; --line:#2a2f3d;
+          --wg:#4f8cff; --opt:#ff9f43; --act:#2ecc71; --lg:#e056fd; --wk:#00cec9; --ga:#a29bfe; --fx:#636e72;
+          --bad:#ff6b6b; --good:#2ecc71; --warn:#ffd166; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:14px/1.55 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  .wrap { max-width:1200px; margin:0 auto; padding:24px; }
+  h1 { font-size:22px; margin:0 0 4px; } h2 { font-size:16px; margin:0 0 12px; } h3 { font-size:14px; margin:14px 0 6px; }
+  .sub { color:var(--mut); margin-bottom:20px; }
+  .grid { display:grid; grid-template-columns:360px 1fr; gap:20px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:20px; }
+  label { display:block; color:var(--mut); font-size:12px; margin:10px 0 4px; }
+  input, select { width:100%; padding:7px 9px; background:#0d0f15; color:var(--fg); border:1px solid var(--line); border-radius:6px; font-size:14px; }
+  .row { display:flex; gap:8px; } .row > div { flex:1; }
+  .seg { display:flex; gap:6px; } .seg button { flex:1; padding:7px; border-radius:6px; border:1px solid var(--line); background:#0d0f15; color:var(--fg); cursor:pointer; font-size:12px; }
+  .seg button.on { background:var(--wg); border-color:var(--wg); }
+  .formula { font-family:ui-monospace,Menlo,monospace; font-size:12.5px; background:#0d0f15; padding:10px; border-radius:6px; white-space:pre-wrap; }
+  .big { font-size:28px; font-weight:700; } .mut { color:var(--mut); }
+  .bar { position:relative; display:flex; height:38px; border-radius:6px; overflow:hidden; margin:12px 0 6px; background:#0d0f15; }
+  .bar div { display:flex; align-items:center; justify-content:center; font-size:12px; color:#0b0d12; font-weight:600; overflow:hidden; white-space:nowrap; }
+  .cap { position:absolute; top:0; bottom:0; width:2px; background:#fff; }
+  .legend span { display:inline-flex; align-items:center; gap:6px; margin-right:14px; font-size:12.5px; }
+  .sw { width:12px; height:12px; border-radius:3px; display:inline-block; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { padding:6px 8px; border-bottom:1px solid var(--line); text-align:right; vertical-align:top; }
+  th:first-child, td:first-child { text-align:left; }
+  th { color:var(--mut); font-weight:500; }
+  table.text td, table.text th { text-align:left; }
+  td.cell { cursor:pointer; } td.cell:hover { background:#232838; }
+  td.best { color:var(--warn); font-weight:700; }
+  td.sel { outline:2px solid var(--wg); outline-offset:-2px; }
+  .ok { color:var(--good); font-weight:700; } .oom { color:var(--bad); font-weight:700; } .tight { color:var(--warn); font-weight:700; }
+  .mesh { display:inline-grid; gap:2px; margin-top:10px; }
+  .mesh i { width:11px; height:11px; border-radius:2px; display:block; }
+  .note { color:var(--mut); font-size:12px; }
+  code { background:#0d0f15; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .explain p { margin:6px 0; } .explain ul { margin:6px 0; padding-left:20px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Trainer Memory &amp; GPU Count Calculator: FSDP × Context Parallel (calibrated)</h1>
+  <div class="sub">BF16 RL/LLM training on N = X (FSDP) × Y (CP/SP) GPUs. Model state is sharded over all N GPUs, and each sequence is split across the Y GPUs of its CP group. The per-token terms are calibrated from a PyTorch allocator snapshot of a real GLM-5.2-scale MoE training run. All units are GiB (2<sup>30</sup> B).</div>
+
+  <div class="grid">
+    <!-- ======================= LEFT: knobs ======================= -->
+    <div>
+      <div class="card">
+        <h2>1 · Model</h2>
+        <label>Preset</label>
+        <select id="preset"></select>
+        <label>Total parameters P (billions)</label>
+        <input id="params" type="number" step="any">
+        <div class="row">
+          <div><label>Layers L</label><input id="layers" type="number"></div>
+          <div><label>Hidden H</label><input id="hidden" type="number"></div>
+        </div>
+        <div class="row">
+          <div><label>Vocab V</label><input id="vocab" type="number"></div>
+          <div><label>Expert parallel EP</label><input id="ep" type="number"></div>
+        </div>
+        <label>Routed-expert parameters E (billions; 0 for dense). EP shards only these.</label>
+        <input id="experts" type="number" step="any">
+        <label>Optimizer (persistent bytes/param on top of 4 B for weights and grads)</label>
+        <div class="seg" id="optSeg">
+          <button data-v="adam">Adam (+12 → 16 B)</button>
+          <button data-v="muon" class="on">Muon (+8 → 12 B)</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>2 · Workload</h2>
+        <div class="row">
+          <div><label>Sequence length S (packed, tokens)</label><input id="seq" type="number"></div>
+          <div><label>Micro-batch MBS (sequences)</label><input id="mbs" type="number" value="1"></div>
+        </div>
+        <div class="note">In packed RL training, use <code>max_seq_len</code>: the longest packed micro-batch sets the peak.</div>
+      </div>
+
+      <div class="card">
+        <h2>3 · Parallelism &amp; hardware</h2>
+        <label>GPU (capacity as reported by nvidia-smi, GiB)</label>
+        <select id="gpu"></select>
+        <div class="row">
+          <div><label>FSDP degree X</label><input id="fsdp" type="number" min="1" value="16"></div>
+          <div><label>CP / SP degree Y</label><input id="cp" type="number" min="1" value="4"></div>
+        </div>
+        <div class="row">
+          <div><label>Non-PyTorch reserve (CUDA ctx, NCCL), GiB</label><input id="reserve" type="number" step="1" value="8"></div>
+          <div><label>Round N up to multiple of</label><input id="roundN" type="number" min="1" value="8"></div>
+        </div>
+        <div class="note" style="margin-top:6px">Click any cell in the sweep table to load that X × Y configuration.</div>
+      </div>
+
+      <div class="card">
+        <h2>4 · Per-token and overhead terms (calibrated)</h2>
+        <label>Transient working-set scenario</label>
+        <div class="seg" id="wkSeg">
+          <button data-v="136">Snapshot (136)</button>
+          <button data-v="190" class="on">Pessimistic peak (190)</button>
+          <button data-v="custom">Custom</button>
+        </div>
+        <label>Transient working-set multiplier w (bytes = w × tokens/GPU × H × 2 B)</label>
+        <input id="wkc" type="number" step="1" value="190">
+        <label>Logit memory at peak, as fp32 [T × V] equivalents (measured ≈ 0; old eager path ≈ 1.2)</label>
+        <input id="nlog" type="number" step="0.1" value="0">
+        <div class="row">
+          <div><label>FSDP gather: live copies c of one layer's local bf16 params</label><input id="gk" type="number" step="0.1" value="2"></div>
+          <div><label>Fragmentation (reserved / allocated − 1), %</label><input id="frag" type="number" step="1" value="0"></div>
+        </div>
+        <div class="note" style="margin-top:6px">See the "Where the defaults come from" section below for how each value was measured.</div>
+      </div>
+    </div>
+
+    <!-- ======================= RIGHT: results ======================= -->
+    <div>
+      <div class="card">
+        <h2>Per-GPU peak memory</h2>
+        <div class="formula" id="formula"></div>
+        <div style="margin-top:12px"><span class="big" id="perGpu"></span> <span id="fit"></span></div>
+        <div class="mut" id="perGpuSub"></div>
+        <div class="bar" id="bar"></div>
+        <div class="legend">
+          <span><i class="sw" style="background:var(--wg)"></i>Weights + grads shard</span>
+          <span><i class="sw" style="background:var(--opt)"></i>Optimizer shard</span>
+          <span><i class="sw" style="background:var(--act)"></i>Layer-input checkpoints</span>
+          <span><i class="sw" style="background:var(--wk)"></i>Transient working set</span>
+          <span><i class="sw" style="background:var(--lg)"></i>Logits</span>
+          <span><i class="sw" style="background:var(--ga)"></i>FSDP gather</span>
+          <span><i class="sw" style="background:var(--fx)"></i>Fragmentation</span>
+          <span><i class="sw" style="background:#fff"></i>Allocator limit</span>
+        </div>
+        <div id="range" class="note" style="margin-top:8px"></div>
+        <div class="mesh" id="mesh"></div>
+        <div class="note" id="meshLabel"></div>
+      </div>
+
+      <div class="card">
+        <h2>Minimum GPUs for each CP degree</h2>
+        <div class="note" style="margin-bottom:8px">For each Y, X<sub>min</sub> = ⌈ (states / Y) / (limit / (1+frag) − per-token / Y − gather) ⌉, and N = X<sub>min</sub> × Y rounded up to the node multiple. Yellow marks the smallest N in each row. "LB" is the lower bound if everything were spread perfectly.</div>
+        <table id="sweep"></table>
+      </div>
+
+      <div class="card">
+        <h2>Effect of expert parallelism (current model, GPU, X × Y, w)</h2>
+        <div class="note" style="margin-bottom:8px">Changing EP only changes the FSDP gather term. Model states stay at 1/N, and the token-dispatch buffers stay at about tokens × top-k × H<sub>moe</sub> × 2 B. Higher EP does raise routing imbalance (see notes).</div>
+        <table id="epTable"></table>
+      </div>
+
+      <div class="card">
+        <h2>Breakdown</h2>
+        <table id="breakdown"></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======================= Explanation ======================= -->
+  <div class="card explain">
+    <h2>The formula</h2>
+<div class="formula">tokens per GPU      T  = S × MBS / Y
+model states       = (4 + b_opt) × P / N                 b_opt = 12 (Adam) or 8 (Muon); N = X × Y
+layer checkpoints  = L × 2 B × H × T                     full activation checkpointing: one bf16 input per layer
+transient          = w × T × H × 2 B                     one layer's recompute + MoE dispatch + attention + backward
+logits             = n_logit × T × V × 4 B               0 at peak with the chunked log-prob path
+FSDP gather        = c × 2 B × [ (P − E) / L + E / (L × EP) ]   c live copies of one layer's local bf16 params
+allocated peak     = states + checkpoints + transient + logits + gather
+reserved peak      = allocated × (1 + frag)
+fits if            reserved peak ≤ GPU capacity − non-PyTorch reserve</div>
+    <p>Only <b>model states</b> shrink as you add FSDP GPUs. Checkpoints, transient memory and logits depend only on tokens per GPU (S / Y), so CP/SP is the lever for them. The gather buffers depend on EP. With FSDP alone you eventually hit a floor where the per-token terms fill the GPU, and adding FSDP GPUs no longer helps.</p>
+
+    <h3>What the persistent state looks like (measured)</h3>
+    <p>The 12 B/param for Muon is <b>fp32 parameter shard (4) + fp32 gradient shard (4) + fp32 momentum (4)</b>. There is no persistent bf16 weight copy: FSDP2 casts to bf16 only while gathering a layer. Adam adds a second moment: 4 + 4 + 4 + 4 = 16 B. This matches the "4 B weights+grads + 12/8 B optimizer" accounting in total, though the split differs.</p>
+
+    <h3>Where the defaults come from</h3>
+    <table class="text">
+      <tr><th>Knob</th><th>Default</th><th>Source</th></tr>
+      <tr><td>States 12 B/param (Muon)</td><td>exact</td><td>Snapshot: param shards 43.2 + Muon momentum 43.2 + fp32 grads 43.3 = <b>129.6 GiB</b> = 12 × 744B / 64</td></tr>
+      <tr><td>Layer checkpoints</td><td>L × 2 × H × T</td><td>Snapshot: 76 tensors × 0.26 GiB = <b>19.9 GiB</b> at T ≈ 22.8K, an exact match</td></tr>
+      <tr><td>Transient multiplier w</td><td>136 / 190</td><td>Snapshot: peak 190.4 − states 129.6 − ckpt 19.9 − gather 5.4 ⇒ 35.5 GiB at 22.8K tokens ⇒ <b>w ≈ 136</b>. A second run at the same topology reported a peak of 235.7 GiB at up to 32.8K tokens/GPU ⇒ <b>w ≈ 190</b> (pessimistic; includes the longest batch and uneven expert load).</td></tr>
+      <tr><td>Logits n_logit</td><td>0</td><td>Snapshot: the output head emits one bf16 [T × V] tensor (6.6 GiB), and a chunked log-prob/loss computation allocates ≤ 1.2 GiB per chunk. That phase peaks at 171.5 GiB, below the 190.4 peak, which occurs during layer forward/recompute. Use ≈ 1.2 for an unchunked, unfused loss, where the peak can move into the loss.</td></tr>
+      <tr><td>FSDP gather c</td><td>2</td><td>Snapshot: one GLM layer's local params in bf16 = 0.25B non-expert + 32 of 256 experts (1.21B) = <b>2.7 GiB</b>. The FSDP buffers seen were the flat all-gather buffer (2.25 GiB experts + 0.38 + 0.28 groups), the copied-out unsharded params (2.65 GiB), and the backward reduce-scatter input (2.53 GiB, bf16). Their maximum simultaneous total was <b>5.30 GiB ≈ 1.9 copies</b>.</td></tr>
+      <tr><td>Non-PyTorch reserve</td><td>8 GiB</td><td>CUDA context, NCCL and cuBLAS workspaces outside the caching allocator</td></tr>
+      <tr><td>Fragmentation</td><td>0%</td><td>Snapshot: reserved 198.8 vs allocated 190.4 GiB (~4%). Set it to 5% for a reserved-memory estimate.</td></tr>
+    </table>
+
+    <h3>Calibration run</h3>
+    <p>GLM-5.2 trainer: 744B parameters, 78 layers, H = 6144, V = 154,880. 64 × B300 with FSDP 16 × SP 4, EP 8, Muon, packed sequences up to 131K. Source: a rank-0 PyTorch allocator snapshot (<code>torch.cuda.memory._dump_snapshot</code>) covering the last ~400 s / 1M allocator events.</p>
+    <table>
+      <tr><th>Component at peak (190.4 GiB)</th><th>GiB</th></tr>
+      <tr><td>Parameter shards (fp32)</td><td>43.2</td></tr>
+      <tr><td>Muon momentum (fp32)</td><td>43.2</td></tr>
+      <tr><td>Gradient shards (fp32, FSDP reduce output)</td><td>43.3</td></tr>
+      <tr><td>Layer-input checkpoints (76 × 0.26)</td><td>19.9</td></tr>
+      <tr><td>MoE kernel overhead: token dispatch, permute / scatter, expert all-to-all, grouped-GEMM outputs</td><td>~14</td></tr>
+      <tr><td>Sparse attention kernels, SP all-to-all, indexer</td><td>~13</td></tr>
+      <tr><td>FSDP all-gather / reduce buffers</td><td>~5</td></tr>
+      <tr><td>Other transient</td><td>~9</td></tr>
+    </table>
+
+    <h3>Configurations checked against reality</h3>
+    <table class="text">
+      <tr><th>Config (GLM, B300)</th><th>Calculator</th><th>Reality</th></tr>
+      <tr><td>64 GPUs, FSDP 16 × SP 4, up to 131K packed</td><td>~190–236 GiB</td><td>Works: 190.4 GiB in the snapshot, 235.7 GiB peak in a second run</td></tr>
+      <tr><td>128 GPUs, FSDP 64 × SP 2, 90–100K</td><td>~185–227 GiB</td><td>Works (a production run at 90K)</td></tr>
+      <tr><td>48 GPUs, FSDP 12 × SP 4, 131K packed</td><td>~234–279 GiB</td><td>Not tried. At or over the ~260 GiB limit at the pessimistic end. SP 8 (FSDP 6) brings it to ~226.</td></tr>
+    </table>
+
+    <h3>How the FSDP gather term is estimated, and how EP changes memory</h3>
+    <p>FSDP keeps each GPU's parameters as a 1/N shard. To run a layer, it all-gathers that layer's parameters into a bf16 flat buffer, copies them out into unsharded tensors, then frees them (reshard after forward). In backward it also holds that layer's unsharded bf16 gradient as the reduce-scatter input. At any moment about <b>c ≈ 2 copies of one layer</b> are live; the snapshot measured 1.9.</p>
+    <p>With EP, a GPU only gathers <b>its own experts</b>. Each GPU holds 1/EP of each layer's routed experts, and FSDP shards those across the other N/EP GPUs. Non-expert weights (attention, norms, router, shared experts) are not divided by EP. So one layer's local bf16 size is 2 B × [(P − E)/L + E/(L·EP)].</p>
+    <ul>
+      <li><b>Model states:</b> unchanged by EP. Experts are still sharded 1/N overall; the snapshot's 43.2 GiB param shard equals exactly 4 B × 744B / 64.</li>
+      <li><b>FSDP gather:</b> the expert part falls as 1/EP. For GLM-5.2: EP 1 → 36.9 GiB, EP 2 → 18.9, EP 4 → 9.9, <b>EP 8 → 5.4</b>, EP 16 → 3.2, EP 64 → 1.5. The non-expert part (~0.5 GiB/layer) is a floor, so beyond EP 8 the savings are only a few GiB.</li>
+      <li><b>Token-dispatch buffers:</b> each is about T × top-k × H<sub>moe</sub> × 2 B, independent of EP. The snapshot shows 2.09 GiB buffers = 22.8K × 8 × 6144 × 2 B, with about six live at once (~14 GiB). These are included in w.</li>
+      <li><b>Routing imbalance:</b> receive buffers depend on how many tokens hit this GPU's experts. The snapshot's largest receive buffer was 2.47 GiB against the 2.09 average (1.18×) at EP 8 with 32 experts per GPU. Fewer experts per GPU (higher EP) average out less, so the worst rank's peak can grow.</li>
+      <li><b>Layout:</b> EP must divide N and the expert count. It usually stays within NVLink (≤ 8 per node, or one NVL72 domain), because all-to-all across nodes is slow.</li>
+    </ul>
+
+    <h3>Kimi K3 / K3.1 preset</h3>
+    <p>From the Hugging Face <code>config.json</code>: 93 layers (1 dense), H = 7168, 896 routed experts (top-16) + 2 shared, expert FFN 3072 on a <b>3584-dim latent</b> (latent MoE), vocab 163,840. The model card says 2.8T total / 104B active. Routed experts are 92 × 896 × 3 × 3584 × 3072 ≈ <b>2.72T</b>, and the computed total is ≈ 2.78T. Dispatch per token is 16 × 3584 = 8 × H, the same multiple of H as GLM (8 × 6144), so the GLM-calibrated w is a reasonable first guess. Its attention (69 KDA linear-attention + 24 DSA/MLA layers) differs from GLM's, so recalibrate w from a Kimi snapshot before relying on it.</p>
+
+    <h3>Caveats</h3>
+    <ul>
+      <li>The per-token terms come from one model family (GLM MoE + sparse attention, one MoE kernel implementation, EP 8). Dense models or other attention kernels will have a different w, so recalibrate from a snapshot.</li>
+      <li>Linear scaling in tokens per GPU is assumed. The MoE routing buffers depend on routing balance, and the worst rank sets the peak.</li>
+      <li>Throughput, global-batch divisibility (the number of DP replicas X must divide the packed batch count), and the cost of SP all-to-all are not modeled. Memory is necessary, not sufficient.</li>
+    </ul>
+  </div>
+</div>
+
+<script>
+const PRESETS = {
+  "GLM-5.2 / 5.3 (744B MoE, 40B active)":  { p: 744,  L: 78, H: 6144, S: 100000, V: 154880, EP: 8, E: 724.8 },
+  "Kimi K3 / K3.1 (2.78T MoE, 104B active)": { p: 2780, L: 93, H: 7168, S: 100000, V: 163840, EP: 8, E: 2722.7 },
+  "DeepSeek-V3 (671B MoE)":                { p: 671,  L: 61, H: 7168, S: 100000, V: 129280, EP: 8, E: 654 },
+  "Qwen3-235B-A22B":                       { p: 235,  L: 94, H: 4096, S: 100000, V: 151936, EP: 8, E: 227 },
+  "Llama-3 70B":                           { p: 70,   L: 80, H: 8192, S: 100000, V: 128256, EP: 1, E: 0 },
+  "Llama-3 8B":                            { p: 8,    L: 32, H: 4096, S: 100000, V: 128256, EP: 1, E: 0 },
+  "Custom": null,
+};
+// Capacities as reported by nvidia-smi (approximate), in GiB.
+const GPUS = [["H100 80GB", 79.6], ["H200 141GB", 140.4], ["B200 180GB", 179.1], ["B300 288GB", 268.6]];
+const CPS = [1, 2, 4, 8, 16, 32];
+const OPT = { adam: 12, muon: 8 };
+const GiB = 2 ** 30;
+let opt = "muon";
+const $ = id => document.getElementById(id);
+const g = b => (b / GiB).toFixed(1) + " GiB";
+const num = x => x.toLocaleString("en-US");
+
+for (const k in PRESETS) $("preset").add(new Option(k, k));
+GPUS.forEach(([n], i) => $("gpu").add(new Option(`${n} (${GPUS[i][1]} GiB)`, i)));
+$("gpu").value = 3;
+
+function applyPreset() {
+  const p = PRESETS[$("preset").value]; if (!p) return;
+  $("params").value = p.p; $("layers").value = p.L; $("hidden").value = p.H; $("seq").value = p.S;
+  $("vocab").value = p.V; $("ep").value = p.EP; $("experts").value = p.E; calc();
+}
+$("preset").onchange = applyPreset;
+["params","layers","hidden","seq","mbs","vocab","ep","experts","fsdp","cp","gpu","reserve","roundN","wkc","nlog","gk","frag"]
+  .forEach(id => $(id).addEventListener("input", () => {
+    if (["params","layers","hidden","vocab","ep","experts"].includes(id)) $("preset").value = "Custom";
+    if (id === "wkc") setSeg("wkSeg", ["136","190"].includes($("wkc").value) ? $("wkc").value : "custom");
+    calc();
+  }));
+function setSeg(seg, v) { document.querySelectorAll(`#${seg} button`).forEach(x => x.classList.toggle("on", x.dataset.v === v)); }
+document.querySelectorAll("#optSeg button").forEach(b => b.onclick = () => { setSeg("optSeg", b.dataset.v); opt = b.dataset.v; calc(); });
+document.querySelectorAll("#wkSeg button").forEach(b => b.onclick = () => {
+  setSeg("wkSeg", b.dataset.v); if (b.dataset.v !== "custom") $("wkc").value = b.dataset.v; calc();
+});
+
+function model(w, epOverride) {
+  const P = +$("params").value * 1e9, L = +$("layers").value, H = +$("hidden").value, V = +$("vocab").value;
+  const S = +$("seq").value, M = +$("mbs").value || 1, EP = epOverride || Math.max(1, +$("ep").value || 1);
+  const E = Math.min(+$("experts").value * 1e9 || 0, P);
+  const ob = OPT[opt], nlog = +$("nlog").value, gk = +$("gk").value, frag = +$("frag").value / 100;
+  const seqTok = S * M;
+  return {
+    P, L, H, V, S, M, EP, ob, nlog, gk, frag, w, seqTok,
+    wg: 4 * P, os: ob * P, states: (4 + ob) * P,
+    // per-sequence bytes; divide by Y for per GPU
+    ckptSeq: L * 2 * H * seqTok, wkSeq: w * seqTok * H * 2, lgSeq: nlog * seqTok * V * 4,
+    gather: gk * 2 * ((P - E) / L + E / (L * EP)), E,
+  };
+}
+function perGpu(m, X, Y) {
+  const N = X * Y;
+  const t = { wg: m.wg / N, os: m.os / N, ckpt: m.ckptSeq / Y, wk: m.wkSeq / Y, lg: m.lgSeq / Y, ga: m.gather };
+  t.alloc = t.wg + t.os + t.ckpt + t.wk + t.lg + t.ga; t.fr = t.alloc * m.frag; t.tot = t.alloc + t.fr;
+  return t;
+}
+function minX(m, limit, Y) {
+  const free = limit / (1 + m.frag) - (m.ckptSeq + m.wkSeq + m.lgSeq) / Y - m.gather;
+  return free <= 0 ? null : Math.max(1, Math.ceil(m.states / Y / free));
+}
+function roundN(n) { const r = Math.max(1, +$("roundN").value | 0); return Math.ceil(n / r) * r; }
+
+function calc() {
+  const m = model(+$("wkc").value);
+  const X = Math.max(1, +$("fsdp").value | 0), Y = Math.max(1, +$("cp").value | 0), N = X * Y;
+  const [gName, gGiB] = GPUS[+$("gpu").value];
+  const limit = (gGiB - (+$("reserve").value)) * GiB;
+  const t = perGpu(m, X, Y), T = m.seqTok / Y;
+
+  $("formula").textContent =
+`N = X × Y = ${X} × ${Y} = ${N} GPUs      tokens/GPU T = ${num(m.S)} × ${m.M} / ${Y} = ${num(Math.round(T))}
+weights+grads / N = 4 B × ${m.P/1e9}B / ${N}                 = ${g(t.wg)}
+optimizer / N     = ${m.ob} B × ${m.P/1e9}B / ${N}                 = ${g(t.os)}
+layer ckpts       = ${m.L} × 2 B × ${num(m.H)} × ${num(Math.round(T))}         = ${g(t.ckpt)}
+transient         = ${m.w} × ${num(Math.round(T))} × ${num(m.H)} × 2 B        = ${g(t.wk)}
+logits            = ${m.nlog} × ${num(Math.round(T))} × ${num(m.V)} × 4 B       = ${g(t.lg)}
+FSDP gather       = ${m.gk} × 2 B × [${((m.P-m.E)/1e9).toFixed(0)}B/${m.L} + ${(m.E/1e9).toFixed(0)}B/(${m.L}×EP ${m.EP})] = ${g(t.ga)}
+fragmentation     = ${(m.frag*100).toFixed(0)}% × ${g(t.alloc)}                   = ${g(t.fr)}
+──────────────────────────────────────────────────────
+per-GPU peak      = ${g(t.tot)}    limit = ${gGiB} − ${$("reserve").value} = ${g(limit)}`;
+
+  $("perGpu").textContent = g(t.tot);
+  const r = t.tot / limit;
+  $("fit").innerHTML = r <= 0.9 ? `<span class="ok">✓ fits on ${gName}</span>`
+    : r <= 1 ? `<span class="tight">⚠ fits, under 10% headroom</span>` : `<span class="oom">✗ OOM on ${gName}</span>`;
+  $("perGpuSub").textContent = `${(r*100).toFixed(0)}% of allocator limit · ${r <= 1 ? g(limit - t.tot) + " free" : g(t.tot - limit) + " over"}`;
+
+  const lo = perGpu(model(136), X, Y).tot, hi = perGpu(model(190), X, Y).tot;
+  $("range").innerHTML = `Calibrated range for this config: <b>${g(lo)}</b> (snapshot, w = 136) to <b>${g(hi)}</b> (pessimistic peak, w = 190).`;
+
+  const scale = Math.max(t.tot, limit);
+  $("bar").innerHTML = [[t.wg,"--wg"],[t.os,"--opt"],[t.ckpt,"--act"],[t.wk,"--wk"],[t.lg,"--lg"],[t.ga,"--ga"],[t.fr,"--fx"]]
+    .map(([v, c]) => { const p = v / scale * 100; return `<div style="width:${p}%;background:var(${c})">${p > 7 ? (v/GiB).toFixed(0) : ""}</div>`; }).join("")
+    + `<span class="cap" style="left:calc(${limit/scale*100}% - 2px)"></span>`;
+
+  if (N <= 1024) {
+    const cols = Math.min(X, 64);
+    $("mesh").style.gridTemplateColumns = `repeat(${cols}, 11px)`;
+    let h = "";
+    for (let b0 = 0; b0 < X; b0 += 64) for (let c = 0; c < Y; c++) for (let rr = b0; rr < Math.min(X, b0 + 64); rr++)
+      h += `<i style="background:hsl(${(rr * 47) % 360} 60% 55%)"></i>`;
+    $("mesh").innerHTML = h;
+    $("meshLabel").textContent = `Mesh: ${X} columns = FSDP replicas (one color = one sequence in flight) × ${Y} rows = CP ranks sharing it · ${Math.ceil(N/8)} nodes of 8`;
+  } else { $("mesh").innerHTML = ""; $("meshLabel").textContent = `${N} GPUs (too many to draw)`; }
+
+  let tb = `<tr><th>GPU (${opt}, w = ${m.w})</th>${CPS.map(c => `<th>Y=${c}</th>`).join("")}<th>LB</th></tr>`;
+  GPUS.forEach(([n, cap], gi) => {
+    const lim = (cap - (+$("reserve").value)) * GiB;
+    const cells = CPS.map(y => { const x = minX(m, lim, y); return x ? { x, y, n: roundN(x * y) } : null; });
+    const best = Math.min(...cells.filter(Boolean).map(v => v.n));
+    tb += `<tr><td>${n}</td>` + cells.map(v => !v ? `<td class="oom">✗</td>` :
+      `<td class="cell ${v.n === best ? "best" : ""} ${gi === +$("gpu").value && v.x === X && v.y === Y ? "sel" : ""}"
+        data-g="${gi}" data-x="${v.x}" data-y="${v.y}" title="X=${v.x}, Y=${v.y}">${v.n}<br><span class="mut">${v.x}×${v.y}</span></td>`).join("")
+      + `<td class="mut">${Math.ceil((m.states + m.ckptSeq + m.wkSeq + m.lgSeq) / lim)}</td></tr>`;
+  });
+  $("sweep").innerHTML = tb;
+  document.querySelectorAll("#sweep td.cell").forEach(td => td.onclick = () => {
+    $("gpu").value = td.dataset.g; $("fsdp").value = td.dataset.x; $("cp").value = td.dataset.y; calc();
+  });
+
+  let et = `<tr><th>EP</th><th>Local experts share</th><th>FSDP gather</th><th>Per-GPU peak (this X × Y)</th><th>Fits?</th><th>Min N at Y = ${Y}</th></tr>`;
+  [1, 2, 4, 8, 16, 32, 64].forEach(ep => {
+    const me = model(m.w, ep), te = perGpu(me, X, Y), xm = minX(me, limit, Y);
+    const fit = te.tot <= limit * 0.9 ? '<span class="ok">✓</span>' : te.tot <= limit ? '<span class="tight">⚠</span>' : '<span class="oom">✗</span>';
+    et += `<tr${ep === m.EP ? ' style="background:#232838"' : ''}><td>${ep}</td><td>1/${ep}</td><td>${g(te.ga)}</td><td>${g(te.tot)}</td><td>${fit}</td><td>${xm ? roundN(xm * Y) + ` (${xm}×${Y})` : '✗'}</td></tr>`;
+  });
+  $("epTable").innerHTML = et;
+
+  $("breakdown").innerHTML = `<tr><th>Component</th><th>Scales with</th><th>Per GPU</th><th>Share</th></tr>` +
+    [["Weights + grads (4 B/param)", "1 / N", t.wg], [`Optimizer (${opt}, ${m.ob} B/param)`, "1 / N", t.os],
+     ["Layer-input checkpoints", "S / Y", t.ckpt], ["Transient working set", "S / Y", t.wk],
+     ["Logits", "S / Y", t.lg], ["FSDP gather buffers", "1 / EP", t.ga], ["Fragmentation", "total", t.fr]]
+      .map(([n, s, v]) => `<tr><td>${n}</td><td>${s}</td><td>${g(v)}</td><td>${(v/t.tot*100).toFixed(1)}%</td></tr>`).join("") +
+    `<tr><td><b>Total</b></td><td></td><td><b>${g(t.tot)}</b></td><td>100%</td></tr>`;
+}
+$("preset").value = Object.keys(PRESETS)[0];
+applyPreset();
+</script>
+</body>
+</html>
